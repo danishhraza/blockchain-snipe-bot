@@ -18,28 +18,8 @@
 
       <section class="controls">
         <div class="control-card">
-          <h2>Tracked Wallets</h2>
-          <p>Add multiple wallets per chain (comma or line separated). Use nickname:address to label wallets.</p>
-          <div class="input-grid">
-            <label>
-              Base (EVM)
-              <textarea id="baseWallets" placeholder="0xabc...\n0xdef..."></textarea>
-            </label>
-            <label>
-              Solana
-              <textarea id="solanaWallets" placeholder="9xZ...\nG1K..."></textarea>
-            </label>
-          </div>
-          <button id="updateWallets">Update Wallets</button>
-        </div>
-
-        <div class="control-card">
           <h2>Live Metrics</h2>
           <div class="metrics">
-            <div>
-              <span class="metric-label">Tracked wallets</span>
-              <span class="metric-value" id="walletCount">0</span>
-            </div>
             <div>
               <span class="metric-label">Latest buy value</span>
               <span class="metric-value" id="latestValue">-</span>
@@ -56,7 +36,8 @@
         <h2>Live Buy Feed</h2>
         <div class="feed-table">
           <div class="feed-row feed-header">
-            <span>Wallet</span>
+            <span>Trader</span>
+            <span>Side</span>
             <span>Chain</span>
             <span>Token</span>
             <span>Contract / Mint</span>
@@ -85,11 +66,12 @@
               Wallet buys
             </div>
           </div>
-          <canvas id="priceChart" width="1100" height="320"></canvas>
+          <div id="priceChart" class="price-chart"></div>
         </div>
       </section>
     </div>
 
+    <script src="https://unpkg.com/lightweight-charts@4.1.0/dist/lightweight-charts.standalone.production.js"></script>
     <script src="app.js"></script>
   </body>
 </html>

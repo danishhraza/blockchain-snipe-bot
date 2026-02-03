@@ -1,22 +1,122 @@
 const crypto = require('crypto');
 const http = require('http');
+const https = require('https');
 const fs = require('fs');
 const path = require('path');
 
+function loadEnv() {
+  const envPath = path.join(__dirname, '.env');
+  if (!fs.existsSync(envPath)) {
+    return;
+  }
+  const content = fs.readFileSync(envPath, 'utf8');
+  content.split(/\r?\n/).forEach((line) => {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) {
+      return;
+    }
+    const eqIndex = trimmed.indexOf('=');
+    if (eqIndex === -1) {
+      return;
+    }
+    const key = trimmed.slice(0, eqIndex).trim();
+    const value = trimmed.slice(eqIndex + 1).trim();
+    if (!process.env[key]) {
+      process.env[key] = value;
+    }
+  });
+}
+
+loadEnv();
+
 const PORT = process.env.PORT || 3000;
 const MIN_TRADE_USD = 500;
+const DEXSCREENER_BASE_URL = 'https://api.dexscreener.com';
+const ALCHEMY_WEBHOOK_SIGNING_KEY =
+  process.env.ALCHEMY_WEBHOOK_SIGNING_KEY ||
+  process.env.ALCHEMY_SIGNING_KEY ||
+  process.env.ALCHEMY_AUTH_TOKEN ||
+  '';
+const WEBHOOK_PATH = '/webhooks/alchemy';
 
 const publicDir = path.join(__dirname, 'public');
 
 const state = {
-  wallets: {
-    base: new Set(),
-    solana: new Set(),
-  },
   trades: [],
 };
 
 const clients = new Set();
+const tracking = {
+  base: {
+    seenTxs: new Map(),
+  },
+};
+
+const STABLE_SYMBOLS = new Set(['USDC', 'USDT', 'DAI', 'USDBC']);
+const BASE_STABLE_ADDRESSES = new Set([
+  '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913',
+  '0xd9aaec86b65d86f6a7b5b1b0c42ffa531710b6ca',
+]);
+const SOLANA_STABLE_MINTS = new Set([
+  'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v',
+  'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB',
+]);
+const SOLANA_SOL_MINT = 'So11111111111111111111111111111111111111112';
+const PRICE_CACHE = new Map();
+const PRICE_CACHE_TTL_MS = Number(process.env.PRICE_CACHE_TTL_MS || 60000);
+const DEX_CHAIN_IDS = {
+  base: 'base',
+  solana: 'solana',
+  ethereum: 'ethereum',
+};
+
+const DEX_SYMBOL_ADDRESS = {
+  base: {
+    ETH: '0x4200000000000000000000000000000000000006',
+    USDC: '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913',
+    USDT: '0xd9aaec86b65d86f6a7b5b1b0c42ffa531710b6ca',
+  },
+  solana: {
+    SOL: 'So11111111111111111111111111111111111111112',
+    USDC: 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v',
+    USDT: 'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB',
+  },
+  ethereum: {
+    ETH: '0xC02aaA39b223FE8D0A0E5C4F27eAD9083C756Cc2',
+    USDC: '0xA0b86991c6218b36c1d19d4a2e9eb0ce3606eb48',
+    USDT: '0xdAC17F958D2ee523a2206206994597C13D831ec7',
+  },
+};
+
+function parseTrackedWallets(raw) {
+  const set = new Set();
+  const nameByAddress = new Map();
+  if (!raw) {
+    return { set, nameByAddress };
+  }
+  raw
+    .split(/[\n,]+/)
+    .map((entry) => entry.trim())
+    .filter(Boolean)
+    .forEach((entry) => {
+      const separator = entry.includes('=') ? '=' : entry.includes(':') ? ':' : null;
+      const parts = separator ? entry.split(separator) : [entry];
+      const address = parts[parts.length - 1].trim();
+      const name = parts.length > 1 ? parts[0].trim() : '';
+      if (address) {
+        const lower = address.toLowerCase();
+        set.add(lower);
+        if (name) {
+          nameByAddress.set(lower, name);
+        }
+      }
+    });
+  return { set, nameByAddress };
+}
+
+const trackedWalletsParsed = parseTrackedWallets(process.env.TRACKED_WALLETS || '');
+const TRACKED_WALLETS = trackedWalletsParsed.set;
+const TRACKED_WALLET_NAMES = trackedWalletsParsed.nameByAddress;
 
 function sendFrame(socket, payload) {
   const data = Buffer.from(payload);
@@ -56,8 +156,8 @@ function broadcast(payload) {
   }
 }
 
-function recordTrade(trade) {
-  if (trade.valueUsdt < MIN_TRADE_USD) {
+function recordTrade(trade, options = {}) {
+  if (!options.skipFilter && trade.valueUsdt < MIN_TRADE_USD) {
     return;
   }
   state.trades.unshift(trade);
@@ -65,25 +165,401 @@ function recordTrade(trade) {
   broadcast({ type: 'trade', trade });
 }
 
-function updateWallets({ base, solana }) {
-  state.wallets.base = new Set(base);
-  state.wallets.solana = new Set(solana);
-  broadcast({
-    type: 'wallets:update',
-    wallets: {
-      base: [...state.wallets.base],
-      solana: [...state.wallets.solana],
-    },
+function readRequestBody(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    req.on('data', (chunk) => {
+      chunks.push(chunk);
+    });
+    req.on('end', () => {
+      resolve(Buffer.concat(chunks).toString('utf8'));
+    });
+    req.on('error', reject);
   });
 }
 
-function parseWallets(input) {
-  if (!Array.isArray(input)) {
-    return [];
+function verifyAlchemySignature(body, signature) {
+  if (!ALCHEMY_WEBHOOK_SIGNING_KEY) {
+    return true;
   }
-  return input
-    .map((wallet) => wallet.trim())
-    .filter((wallet) => wallet.length > 0);
+  if (!signature) {
+    return false;
+  }
+  const hmac = crypto.createHmac('sha256', ALCHEMY_WEBHOOK_SIGNING_KEY);
+  hmac.update(body, 'utf8');
+  const digest = hmac.digest('hex');
+  return digest === signature;
+}
+
+function rememberSeen(cache, key) {
+  cache.set(key, Date.now());
+}
+
+function pruneSeen(cache, maxAgeMs = 60 * 60 * 1000) {
+  const cutoff = Date.now() - maxAgeMs;
+  for (const [key, timestamp] of cache.entries()) {
+    if (timestamp < cutoff) {
+      cache.delete(key);
+    }
+  }
+}
+
+function fetchJson(url, options) {
+  return new Promise((resolve, reject) => {
+    const request = https.request(url, options, (res) => {
+      let data = '';
+      res.on('data', (chunk) => {
+        data += chunk;
+      });
+      res.on('end', () => {
+        try {
+          const parsed = JSON.parse(data);
+          resolve(parsed);
+        } catch (error) {
+          reject(error);
+        }
+      });
+    });
+    request.on('error', reject);
+    if (options.body) {
+      request.write(options.body);
+    }
+    request.end();
+  });
+}
+
+function getCachedPrice(key) {
+  const cached = PRICE_CACHE.get(key);
+  if (!cached) {
+    return null;
+  }
+  if (cached.expiresAt < Date.now()) {
+    PRICE_CACHE.delete(key);
+    return null;
+  }
+  return cached.value;
+}
+
+function setCachedPrice(key, value) {
+  if (value == null || Number.isNaN(value)) {
+    return;
+  }
+  PRICE_CACHE.set(key, { value, expiresAt: Date.now() + PRICE_CACHE_TTL_MS });
+}
+
+function resolveDexAddress(chain, symbol) {
+  const map = DEX_SYMBOL_ADDRESS[chain] || {};
+  return map[symbol.toUpperCase()] || null;
+}
+
+async function fetchDexPrice(chainId, address) {
+  if (!chainId || !address) {
+    return null;
+  }
+  const url = `${DEXSCREENER_BASE_URL}/tokens/v1/${chainId}/${address}`;
+  const response = await fetchJson(url, { method: 'GET' });
+  if (!Array.isArray(response)) {
+    return null;
+  }
+  let best = null;
+  response.forEach((pair) => {
+    const liq = Number(pair?.liquidity?.usd || 0);
+    if (!best || liq > best.liq) {
+      best = { liq, price: Number(pair?.priceUsd || 0) };
+    }
+  });
+  if (!best || !best.price) {
+    return null;
+  }
+  return best.price;
+}
+
+async function getUsdPriceForAddress(chainId, address) {
+  const key = `${chainId}:${address}`.toLowerCase();
+  const cached = getCachedPrice(key);
+  if (cached) {
+    return cached;
+  }
+  const value = await fetchDexPrice(chainId, address);
+  if (value) {
+    setCachedPrice(key, value);
+  }
+  return value;
+}
+
+async function getUsdPriceForSymbol(chain, symbol) {
+  const key = `symbol:${chain}:${symbol}`.toUpperCase();
+  const cached = getCachedPrice(key);
+  if (cached) {
+    return cached;
+  }
+  const address = resolveDexAddress(chain, symbol);
+  const chainId = DEX_CHAIN_IDS[chain] || DEX_CHAIN_IDS.base;
+  const value = address ? await fetchDexPrice(chainId, address) : null;
+  if (value) {
+    setCachedPrice(key, value);
+  }
+  return value;
+}
+
+function extractTokenKey(transfer) {
+  if (transfer.rawContract && transfer.rawContract.address) {
+    return transfer.rawContract.address.toLowerCase();
+  }
+  return transfer.asset || 'ETH';
+}
+
+function isStableTransfer(transfer) {
+  const tokenKey = extractTokenKey(transfer);
+  if (BASE_STABLE_ADDRESSES.has(tokenKey)) {
+    return true;
+  }
+  return STABLE_SYMBOLS.has((transfer.asset || '').toUpperCase());
+}
+
+function normalizeActivityToTransfer(activity) {
+  if (!activity) {
+    return null;
+  }
+  const asset = activity.asset || activity.tokenSymbol || '';
+  const rawAddress =
+    activity.rawContract?.address ||
+    activity.contractAddress ||
+    activity.tokenAddress ||
+    '';
+  const value = Number(activity.value || activity.amount || 0);
+  return {
+    hash: activity.hash || activity.transactionHash || activity.txHash || '',
+    from: activity.fromAddress || activity.from || '',
+    to: activity.toAddress || activity.to || '',
+    value,
+    asset,
+    rawContract: rawAddress ? { address: rawAddress } : undefined,
+    metadata: {
+      blockTimestamp:
+        activity.blockTimestamp ||
+        activity.blockTime ||
+        activity.timestamp ||
+        null,
+    },
+  };
+}
+
+function resolveChainLabel(payload) {
+  const network = payload?.event?.network || payload?.network || '';
+  const normalized = String(network).toLowerCase();
+  if (normalized.includes('base')) {
+    return 'base';
+  }
+  if (normalized.includes('sol')) {
+    return 'solana';
+  }
+  if (normalized.includes('eth')) {
+    return 'ethereum';
+  }
+  return normalized || 'unknown';
+}
+
+function resolveWalletFromActivity(activity, payload) {
+  return (
+    activity.wallet ||
+    activity.address ||
+    activity.fromAddress ||
+    activity.from ||
+    activity.toAddress ||
+    activity.to ||
+    payload?.event?.address ||
+    ''
+  );
+}
+
+async function activityToTrade(activity, payload) {
+  const transfer = normalizeActivityToTransfer(activity);
+  if (!transfer || !transfer.hash) {
+    return null;
+  }
+
+  const chain = resolveChainLabel(payload);
+  const from = (transfer.from || '').toLowerCase();
+  const to = (transfer.to || '').toLowerCase();
+  const isTrackedFrom = TRACKED_WALLETS.has(from);
+  const isTrackedTo = TRACKED_WALLETS.has(to);
+  if (!isTrackedFrom && !isTrackedTo) {
+    return null;
+  }
+  const side = isTrackedFrom ? 'sell' : 'buy';
+  const wallet = isTrackedFrom ? transfer.from : transfer.to;
+  const trackedKey = isTrackedFrom ? from : to;
+  const traderName = TRACKED_WALLET_NAMES.get(trackedKey) || '';
+  const tokenAddress = transfer.rawContract?.address || '';
+  const tokenSymbol = transfer.asset || 'TOKEN';
+
+  let valueUsdt = 0;
+  if (isStableTransfer(transfer)) {
+    valueUsdt = Math.abs(transfer.value || 0);
+  } else if (tokenSymbol.toUpperCase() === 'ETH') {
+    const ethPrice = await getUsdPriceForSymbol('ETH');
+    if (ethPrice) {
+      valueUsdt = Math.abs(transfer.value || 0) * ethPrice;
+    }
+  } else if (tokenSymbol.toUpperCase() === 'SOL') {
+    const solPrice = await getUsdPriceForSymbol('SOL');
+    if (solPrice) {
+      valueUsdt = Math.abs(transfer.value || 0) * solPrice;
+    }
+  } else if (tokenAddress) {
+    const platform = PRICE_PLATFORMS[chain] || PRICE_PLATFORMS.base;
+    const tokenPrice = await getUsdPriceForAddress(platform, tokenAddress);
+    if (tokenPrice) {
+      valueUsdt = Math.abs(transfer.value || 0) * tokenPrice;
+    }
+  }
+
+  const amount = Math.abs(transfer.value || 0);
+  const priceUsdt = amount && valueUsdt ? valueUsdt / amount : 0;
+
+  const rawTimestamp = transfer.metadata?.blockTimestamp;
+  const parsedTimestamp = rawTimestamp ? new Date(rawTimestamp) : null;
+  const timestamp = parsedTimestamp && !Number.isNaN(parsedTimestamp.getTime())
+    ? parsedTimestamp.toISOString()
+    : new Date().toISOString();
+
+  return {
+    chain,
+    wallet,
+    side,
+    trader: wallet,
+    traderName,
+    from: transfer.from || '',
+    to: transfer.to || '',
+    token: {
+      name: tokenSymbol,
+      symbol: tokenSymbol,
+      address: tokenAddress || tokenSymbol,
+    },
+    amount,
+    valueUsdt,
+    priceUsdt,
+    timestamp,
+    txHash: transfer.hash,
+  };
+}
+
+function normalizeSolanaAccountKey(key) {
+  if (!key) {
+    return '';
+  }
+  if (typeof key === 'string') {
+    return key;
+  }
+  if (key.pubkey) {
+    return key.pubkey;
+  }
+  if (key.pubkey && key.pubkey.toBase58) {
+    return key.pubkey.toBase58();
+  }
+  return '';
+}
+
+async function parseSolanaSwap(wallet, tx) {
+  if (!tx || !tx.meta || !tx.transaction) {
+    return null;
+  }
+
+  const pre = new Map();
+  const post = new Map();
+  const owner = wallet;
+
+  (tx.meta.preTokenBalances || []).forEach((balance) => {
+    if (balance.owner === owner) {
+      pre.set(balance.mint, Number(balance.uiTokenAmount?.uiAmount || 0));
+    }
+  });
+  (tx.meta.postTokenBalances || []).forEach((balance) => {
+    if (balance.owner === owner) {
+      post.set(balance.mint, Number(balance.uiTokenAmount?.uiAmount || 0));
+    }
+  });
+
+  const net = new Map();
+  const mints = new Set([...pre.keys(), ...post.keys()]);
+  mints.forEach((mint) => {
+    const delta = (post.get(mint) || 0) - (pre.get(mint) || 0);
+    if (Math.abs(delta) > 0) {
+      net.set(mint, delta);
+    }
+  });
+
+  const accountKeys = tx.transaction.message.accountKeys || [];
+  const walletIndex = accountKeys.findIndex((key) => normalizeSolanaAccountKey(key) === wallet);
+  if (walletIndex !== -1 && Array.isArray(tx.meta.preBalances)) {
+    const preLamports = tx.meta.preBalances[walletIndex] || 0;
+    const postLamports = tx.meta.postBalances[walletIndex] || 0;
+    const deltaSol = (postLamports - preLamports) / 1e9;
+    if (Math.abs(deltaSol) > 0) {
+      net.set(SOLANA_SOL_MINT, deltaSol);
+    }
+  }
+
+  if (net.size < 2) {
+    return null;
+  }
+
+  let stableDelta = 0;
+  for (const [mint, delta] of net.entries()) {
+    if (SOLANA_STABLE_MINTS.has(mint)) {
+      stableDelta += delta;
+    }
+  }
+
+  const netEntries = [...net.entries()];
+  netEntries.sort((a, b) => Math.abs(b[1]) - Math.abs(a[1]));
+  let acquired = netEntries.find(([mint, amount]) => amount > 0 && !SOLANA_STABLE_MINTS.has(mint)) ||
+    netEntries.find(([, amount]) => amount > 0);
+
+  if (!acquired) {
+    return null;
+  }
+
+  const [mint, amount] = acquired;
+  const token = {
+    name: mint === SOLANA_SOL_MINT ? 'Solana' : 'Token',
+    symbol: mint === SOLANA_SOL_MINT ? 'SOL' : 'TOKEN',
+    address: mint,
+  };
+  if (SOLANA_STABLE_MINTS.has(mint)) {
+    token.name = mint === 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v' ? 'USD Coin' : 'Tether USD';
+    token.symbol = mint === 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v' ? 'USDC' : 'USDT';
+  }
+
+  let valueUsdt = Math.abs(stableDelta || 0);
+  if (!valueUsdt && net.has(SOLANA_SOL_MINT)) {
+    const solDelta = net.get(SOLANA_SOL_MINT);
+    const solPrice = await getUsdPriceForSymbol('SOL');
+    if (solPrice) {
+      valueUsdt = Math.abs(solDelta) * solPrice;
+    }
+  }
+  if (!valueUsdt) {
+    const tokenPrice = await getUsdPriceForAddress(PRICE_PLATFORMS.solana, mint);
+    if (tokenPrice) {
+      valueUsdt = Math.abs(amount) * tokenPrice;
+    }
+  }
+  if (valueUsdt < MIN_TRADE_USD) {
+    return null;
+  }
+
+  return {
+    chain: 'solana',
+    wallet,
+    token,
+    amount: Math.abs(amount),
+    valueUsdt,
+    priceUsdt: valueUsdt && amount ? valueUsdt / Math.abs(amount) : 0,
+    timestamp: tx.blockTime ? new Date(tx.blockTime * 1000).toISOString() : new Date().toISOString(),
+    txHash: tx.transaction?.signatures?.[0] || '',
+  };
 }
 
 function decodeFrames(buffer) {
@@ -158,10 +634,6 @@ function handleSocket(socket) {
     JSON.stringify({
       type: 'state',
       trades: state.trades,
-      wallets: {
-        base: [...state.wallets.base],
-        solana: [...state.wallets.solana],
-      },
     })
   );
 
@@ -174,13 +646,7 @@ function handleSocket(socket) {
 
     decoded.messages.forEach((payload) => {
       try {
-        const message = JSON.parse(payload);
-        if (message.type === 'wallets:update') {
-          updateWallets({
-            base: parseWallets(message.wallets?.base),
-            solana: parseWallets(message.wallets?.solana),
-          });
-        }
+        JSON.parse(payload);
       } catch (error) {
         sendFrame(socket, JSON.stringify({ type: 'error', message: 'Invalid message format.' }));
       }
@@ -197,6 +663,78 @@ function handleSocket(socket) {
 }
 
 const server = http.createServer((req, res) => {
+  if (req.method === 'GET' && req.url && req.url.startsWith('/prices')) {
+    const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+    const symbol = url.searchParams.get('symbol');
+    const address = url.searchParams.get('address');
+    const network = url.searchParams.get('network') || 'base';
+    const resolvedPlatform =
+      network === 'solana' ? PRICE_PLATFORMS.solana : PRICE_PLATFORMS.base;
+
+    (async () => {
+      try {
+        let price = null;
+        if (symbol) {
+          price = await getUsdPriceForSymbol(symbol);
+        } else if (address) {
+          price = await getUsdPriceForAddress(resolvedPlatform, address);
+        } else {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'symbol or address is required' }));
+          return;
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ price }));
+      } catch (error) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'price lookup failed' }));
+      }
+    })();
+    return;
+  }
+
+  if (req.method === 'POST' && req.url === WEBHOOK_PATH) {
+    readRequestBody(req)
+      .then(async (body) => {
+        const signature = req.headers['x-alchemy-signature'];
+        if (!verifyAlchemySignature(body, signature)) {
+          res.writeHead(401);
+          res.end('Invalid signature');
+          return;
+        }
+        let payload = null;
+        try {
+          payload = JSON.parse(body);
+        } catch (error) {
+          res.writeHead(400);
+          res.end('Invalid JSON');
+          return;
+        }
+
+        const activityList = payload.activity || payload.event?.activity || [];
+        for (const activity of activityList) {
+          const trade = await activityToTrade(activity, payload);
+          if (!trade) {
+            continue;
+          }
+          if (tracking.base.seenTxs.has(trade.txHash)) {
+            continue;
+          }
+          rememberSeen(tracking.base.seenTxs, trade.txHash);
+          recordTrade(trade, { skipFilter: true });
+        }
+
+        res.writeHead(200);
+        res.end('ok');
+      })
+      .catch((error) => {
+        console.error('Webhook error:', error.message);
+        res.writeHead(500);
+        res.end('error');
+      });
+    return;
+  }
+
   const safePath = req.url === '/' ? '/index.html' : req.url;
   const filePath = path.join(publicDir, decodeURIComponent(safePath));
 
@@ -250,4 +788,11 @@ server.on('upgrade', (req, socket) => {
 
 server.listen(PORT, () => {
   console.log(`Wallet tracker running on http://localhost:${PORT}`);
+  console.log(`Alchemy webhook endpoint: http://localhost:${PORT}${WEBHOOK_PATH}`);
+  if (!ALCHEMY_WEBHOOK_SIGNING_KEY) {
+    console.warn('Alchemy webhook signature verification disabled: missing signing key.');
+  }
+  if (TRACKED_WALLETS.size === 0) {
+    console.warn('No TRACKED_WALLETS configured. Webhook activity will be ignored.');
+  }
 });

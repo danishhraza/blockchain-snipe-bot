@@ -1,24 +1,21 @@
 const statusEl = document.getElementById('connectionStatus');
-const baseInput = document.getElementById('baseWallets');
-const solanaInput = document.getElementById('solanaWallets');
-const updateButton = document.getElementById('updateWallets');
 const feedRows = document.getElementById('feedRows');
-const walletCountEl = document.getElementById('walletCount');
 const latestValueEl = document.getElementById('latestValue');
 const latestTimeEl = document.getElementById('latestTime');
 const chartTitleEl = document.getElementById('chartTitle');
 const chartMetaEl = document.getElementById('chartMeta');
 const chartSubtitleEl = document.getElementById('chartSubtitle');
 const priceChart = document.getElementById('priceChart');
-const chartContext = priceChart ? priceChart.getContext('2d') : null;
-const chartEnabled = Boolean(chartContext);
+const chartEnabled = Boolean(priceChart && window.LightweightCharts);
 
 let socket;
 let trades = [];
 let selectedTokenKey = null;
-const priceSeriesMap = new Map();
-let chartTimer = null;
-const nicknameMap = new Map();
+let chart = null;
+let lineSeries = null;
+let priceTimer = null;
+let activeToken = null;
+const pricePoints = new Map();
 
 function connect() {
   const wsProtocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
@@ -39,76 +36,15 @@ function connect() {
     const message = JSON.parse(event.data);
     if (message.type === 'state') {
       trades = message.trades || [];
-      hydrateWallets(message.wallets);
       renderTrades();
     }
     if (message.type === 'trade') {
       trades.unshift(message.trade);
       trades = trades.slice(0, 200);
       renderTrades();
-      refreshChart();
-    }
-    if (message.type === 'wallets:update') {
-      hydrateWallets(message.wallets);
+      updateChartMarkers();
     }
   });
-}
-
-function hydrateWallets(wallets = {}) {
-  if (wallets.base) {
-    baseInput.value = wallets.base.map((wallet) => formatWalletDisplay(wallet)).join('\n');
-  }
-  if (wallets.solana) {
-    solanaInput.value = wallets.solana.map((wallet) => formatWalletDisplay(wallet)).join('\n');
-  }
-  const walletCount = (wallets.base?.length || 0) + (wallets.solana?.length || 0);
-  walletCountEl.textContent = walletCount.toString();
-}
-
-function sendWalletUpdate() {
-  if (!socket || socket.readyState !== WebSocket.OPEN) {
-    return;
-  }
-  const payload = {
-    type: 'wallets:update',
-    wallets: {
-      base: parseWallets(baseInput.value),
-      solana: parseWallets(solanaInput.value),
-    },
-  };
-  socket.send(JSON.stringify(payload));
-}
-
-function parseWallets(value) {
-  nicknameMap.clear();
-  return value
-    .split(/[\n,]/)
-    .map((wallet) => wallet.trim())
-    .filter(Boolean)
-    .map((wallet) => parseWalletEntry(wallet))
-    .filter((wallet) => wallet.length > 0);
-}
-
-function parseWalletEntry(entry) {
-  if (entry.includes(':')) {
-    const [nickname, address] = entry.split(':').map((part) => part.trim());
-    if (address) {
-      if (nickname) {
-        nicknameMap.set(address, nickname);
-      }
-      return address;
-    }
-    return nickname || '';
-  }
-  return entry;
-}
-
-function formatWalletDisplay(address) {
-  const nickname = nicknameMap.get(address);
-  if (nickname) {
-    return `${nickname}:${address}`;
-  }
-  return address;
 }
 
 function shortenWallet(wallet) {
@@ -159,14 +95,17 @@ function renderTrades() {
 
     const tokenLabel = `${trade.token.name} (${trade.token.symbol})`;
     const time = new Date(trade.timestamp).toISOString().replace('T', ' ').replace('Z', '');
-    const nickname = nicknameMap.get(trade.wallet);
-    const walletLabel = nickname ? `<div class="wallet-nickname">${nickname}</div>` : '';
-    const walletAddress = `<div class="wallet-address">${shortenWallet(trade.wallet)}</div>`;
+    const trader = trade.trader || trade.wallet || '';
+    const traderLabel = trade.traderName
+      ? `<div class="wallet-nickname">${trade.traderName}</div>`
+      : '';
+    const traderAddress = `<div class="wallet-address">${shortenWallet(trader)}</div>`;
 
     const buyUrl = buildPhantomLink(trade);
 
     row.innerHTML = `
-      <span class="wallet-cell" title="${trade.wallet}">${walletLabel}${walletAddress}</span>
+      <span class="wallet-cell" title="${trader}">${traderLabel}${traderAddress}</span>
+      <span class="side ${trade.side || ''}">${(trade.side || '').toUpperCase()}</span>
       <span class="chain ${trade.chain}">${trade.chain}</span>
       <span>${tokenLabel}</span>
       <span class="mono" title="${trade.token.address}">${shortenWallet(trade.token.address)}</span>
@@ -208,13 +147,10 @@ function renderTrades() {
     latestValueEl.textContent = `${formatNumber(latest.valueUsdt, 2)} USDT`;
     latestTimeEl.textContent = new Date(latest.timestamp).toISOString().replace('T', ' ').replace('Z', '');
   }
+  updateChartMarkers();
 }
 
-updateButton.addEventListener('click', () => {
-  sendWalletUpdate();
-});
-
-drawEmptyChart();
+initChart();
 connect();
 
 function buildPhantomLink(trade) {
@@ -230,6 +166,11 @@ function selectToken(trade) {
     return;
   }
   selectedTokenKey = trade.token.address;
+  activeToken = {
+    address: trade.token.address,
+    symbol: trade.token.symbol,
+    chain: trade.chain,
+  };
   if (chartTitleEl) {
     chartTitleEl.textContent = `${trade.token.name} (${trade.token.symbol})`;
   }
@@ -237,147 +178,105 @@ function selectToken(trade) {
     chartMetaEl.textContent = `${trade.chain.toUpperCase()} • ${trade.token.address}`;
   }
   if (chartSubtitleEl) {
-    chartSubtitleEl.textContent = 'Live price curve with buy checkpoints for tracked wallets.';
+    chartSubtitleEl.textContent = 'Live price curve with buy checkpoints from webhook activity.';
   }
-  ensureSeries(trade.token.address, trade.priceUsdt);
-  refreshChart();
-  if (chartTimer) {
-    clearInterval(chartTimer);
+  resetSeriesForToken(selectedTokenKey);
+  fetchAndPlotPrice();
+  if (priceTimer) {
+    clearInterval(priceTimer);
   }
-  chartTimer = setInterval(refreshChart, 3000);
+  priceTimer = setInterval(fetchAndPlotPrice, 10000);
 }
 
-function ensureSeries(tokenKey, seedPrice) {
-  if (priceSeriesMap.has(tokenKey)) {
-    return;
-  }
-  const seed = hashSeed(tokenKey);
-  const series = [];
-  let price = seedPrice || 1 + (seed % 5000) / 1000;
-  const now = Date.now();
-
-  for (let i = 60; i >= 0; i -= 1) {
-    const jitter = ((seed + i * 31) % 100) / 1000;
-    price = Math.max(0.0001, price + (jitter - 0.03));
-    series.push({
-      time: now - i * 60000,
-      price,
-    });
-  }
-
-  priceSeriesMap.set(tokenKey, series);
-}
-
-function refreshChart() {
+function initChart() {
   if (!chartEnabled) {
     return;
   }
-  if (!selectedTokenKey) {
-    drawEmptyChart();
-    return;
-  }
-  const series = priceSeriesMap.get(selectedTokenKey);
-  if (!series) {
-    drawEmptyChart();
-    return;
-  }
-  const lastPoint = series[series.length - 1];
-  const drift = (Math.random() - 0.45) * 0.05;
-  const nextPrice = Math.max(0.0001, lastPoint.price + drift);
-  series.push({ time: Date.now(), price: nextPrice });
-  if (series.length > 120) {
-    series.shift();
-  }
-  drawChart(series, selectedTokenKey);
-}
-
-function drawEmptyChart() {
-  if (!chartEnabled) {
-    return;
-  }
-  chartContext.clearRect(0, 0, priceChart.width, priceChart.height);
-  chartContext.fillStyle = '#8b949e';
-  chartContext.font = '14px system-ui';
-  chartContext.fillText('Select a trade row to render the live chart.', 20, 40);
-}
-
-function drawChart(series, tokenKey) {
-  if (!chartEnabled) {
-    return;
-  }
-  chartContext.clearRect(0, 0, priceChart.width, priceChart.height);
-  chartContext.fillStyle = '#0d1117';
-  chartContext.fillRect(0, 0, priceChart.width, priceChart.height);
-
-  const padding = 50;
-  const width = priceChart.width - padding * 2;
-  const height = priceChart.height - padding * 2;
-  const prices = series.map((point) => point.price);
-  const min = Math.min(...prices);
-  const max = Math.max(...prices);
-
-  chartContext.strokeStyle = '#1f6feb';
-  chartContext.lineWidth = 2;
-  chartContext.beginPath();
-
-  series.forEach((point, index) => {
-    const x = padding + (index / (series.length - 1)) * width;
-    const y = padding + ((max - point.price) / (max - min || 1)) * height;
-    if (index === 0) {
-      chartContext.moveTo(x, y);
-    } else {
-      chartContext.lineTo(x, y);
-    }
+  chart = window.LightweightCharts.createChart(priceChart, {
+    layout: {
+      background: { color: '#0d1117' },
+      textColor: '#c9d1d9',
+    },
+    grid: {
+      vertLines: { color: '#21262d' },
+      horzLines: { color: '#21262d' },
+    },
+    rightPriceScale: {
+      borderColor: '#21262d',
+    },
+    timeScale: {
+      borderColor: '#21262d',
+      timeVisible: true,
+      secondsVisible: false,
+    },
   });
-
-  chartContext.stroke();
-
-  chartContext.strokeStyle = '#21262d';
-  chartContext.lineWidth = 1;
-  chartContext.beginPath();
-  chartContext.rect(padding, padding, width, height);
-  chartContext.stroke();
-
-  drawBuyDots(series, tokenKey, padding, width, height, min, max);
+  lineSeries = chart.addLineSeries({
+    color: '#58a6ff',
+    lineWidth: 2,
+  });
+  chart.timeScale().fitContent();
 }
 
-function drawBuyDots(series, tokenKey, padding, width, height, min, max) {
-  const buys = trades.filter((trade) => trade.token.address === tokenKey);
-  if (buys.length === 0) {
+function resetSeriesForToken(tokenKey) {
+  if (!chartEnabled || !lineSeries) {
     return;
   }
-  const startTime = series[0].time;
-  const endTime = series[series.length - 1].time;
+  const series = pricePoints.get(tokenKey) || [];
+  lineSeries.setData(series);
+  chart.timeScale().fitContent();
+}
 
-  chartContext.fillStyle = '#3fb950';
-  buys.forEach((trade) => {
-    const time = new Date(trade.timestamp).getTime();
-    if (time < startTime || time > endTime) {
+async function fetchAndPlotPrice() {
+  if (!chartEnabled || !activeToken) {
+    return;
+  }
+  const params = new URLSearchParams();
+  const chain = activeToken.chain === 'solana' ? 'solana' : 'base';
+  if (activeToken.address && activeToken.address.startsWith('0x')) {
+    params.set('address', activeToken.address);
+    params.set('network', chain);
+  } else if (activeToken.symbol) {
+    params.set('symbol', activeToken.symbol);
+  } else {
+    return;
+  }
+
+  try {
+    const response = await fetch(`/prices?${params.toString()}`);
+    if (!response.ok) {
       return;
     }
-    const closest = series.reduce((acc, point) => {
-      if (!acc || Math.abs(point.time - time) < Math.abs(acc.time - time)) {
-        return point;
-      }
-      return acc;
-    }, null);
-    if (!closest) {
+    const data = await response.json();
+    if (!data || !data.price) {
       return;
     }
-    const ratio = (closest.time - startTime) / (endTime - startTime || 1);
-    const x = padding + ratio * width;
-    const y = padding + ((max - closest.price) / (max - min || 1)) * height;
-    chartContext.beginPath();
-    chartContext.arc(x, y, 5, 0, Math.PI * 2);
-    chartContext.fill();
-  });
+    const time = Math.floor(Date.now() / 1000);
+    const point = { time, value: data.price };
+    const series = pricePoints.get(selectedTokenKey) || [];
+    series.push(point);
+    if (series.length > 240) {
+      series.shift();
+    }
+    pricePoints.set(selectedTokenKey, series);
+    lineSeries.update(point);
+    updateChartMarkers();
+  } catch (error) {
+    // ignore transient price errors
+  }
 }
 
-function hashSeed(value) {
-  let hash = 0;
-  for (let i = 0; i < value.length; i += 1) {
-    hash = (hash << 5) - hash + value.charCodeAt(i);
-    hash |= 0;
+function updateChartMarkers() {
+  if (!chartEnabled || !lineSeries || !selectedTokenKey) {
+    return;
   }
-  return Math.abs(hash);
+  const markers = trades
+    .filter((trade) => trade.token.address === selectedTokenKey && trade.side === 'buy')
+    .map((trade) => ({
+      time: Math.floor(new Date(trade.timestamp).getTime() / 1000),
+      position: 'aboveBar',
+      color: '#3fb950',
+      shape: 'circle',
+      text: 'Buy',
+    }));
+  lineSeries.setMarkers(markers);
 }
