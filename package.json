@@ -1,0 +1,10 @@
+{
+  "name": "wallet-tracker",
+  "version": "1.0.0",
+  "description": "Real-time multi-chain wallet buy tracker",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js"
+  }
+}
