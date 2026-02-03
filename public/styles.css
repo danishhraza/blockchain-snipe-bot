@@ -142,7 +142,7 @@ button:hover {
 
 .feed-row {
   display: grid;
-  grid-template-columns: 120px 90px 160px 160px 110px 130px 130px 160px 90px;
+  grid-template-columns: 150px 90px 160px 160px 110px 130px 130px 160px 90px 90px;
   gap: 12px;
   padding: 12px;
   border-radius: 12px;
@@ -185,6 +185,22 @@ button:hover {
   font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
 }
 
+.wallet-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.wallet-nickname {
+  font-weight: 600;
+  color: #e6edf3;
+}
+
+.wallet-address {
+  color: #9da7b2;
+  font-size: 12px;
+}
+
 .buy-button {
   background: #238636;
   border: none;
@@ -198,6 +214,25 @@ button:hover {
 
 .buy-button:hover {
   background: #2ea043;
+}
+
+.copy-button {
+  background: #30363d;
+  border: none;
+  color: #e6edf3;
+  padding: 6px 12px;
+  border-radius: 8px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.copy-button:hover {
+  background: #484f58;
+}
+
+.copy-button.copied {
+  background: #1f6feb;
 }
 
 .chart-panel {

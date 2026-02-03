@@ -4,7 +4,6 @@ const fs = require('fs');
 const path = require('path');
 
 const PORT = process.env.PORT || 3000;
-const USE_MOCK = process.env.USE_MOCK !== 'false';
 const MIN_TRADE_USD = 500;
 
 const publicDir = path.join(__dirname, 'public');
@@ -15,19 +14,6 @@ const state = {
     solana: new Set(),
   },
   trades: [],
-};
-
-const TOKENS = {
-  base: [
-    { name: 'Aerodrome', symbol: 'AERO', address: '0x940181a94a35a4569e4529a3cdfb74e38fd98631' },
-    { name: 'Brett', symbol: 'BRETT', address: '0x532f27101965dd16442e59d40670faf5ebb142e4' },
-    { name: 'Degen', symbol: 'DEGEN', address: '0x4ed4e862860bed51a9570b96d89af5e1b0efefed' },
-  ],
-  solana: [
-    { name: 'Bonk', symbol: 'BONK', address: 'DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263' },
-    { name: 'Jupiter', symbol: 'JUP', address: 'JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN' },
-    { name: 'Raydium', symbol: 'RAY', address: '4k3Dyjzvzp8e5f6s39WJvD2JpK6qSgS7G7z5K1g1aG5C' },
-  ],
 };
 
 const clients = new Set();
@@ -210,37 +196,6 @@ function handleSocket(socket) {
   });
 }
 
-function mockTrade(chain) {
-  const wallets = [...state.wallets[chain]];
-  if (wallets.length === 0) {
-    return;
-  }
-  if (Math.random() < 0.5) {
-    return;
-  }
-  const wallet = wallets[Math.floor(Math.random() * wallets.length)];
-  const token = TOKENS[chain][Math.floor(Math.random() * TOKENS[chain].length)];
-  const valueUsdt = Math.round((MIN_TRADE_USD + Math.random() * 2500) * 100) / 100;
-  const priceUsdt = Math.round((0.1 + Math.random() * 5) * 100000) / 100000;
-  const amount = Math.round((valueUsdt / priceUsdt) * 10000) / 10000;
-
-  recordTrade({
-    id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
-    wallet,
-    chain,
-    token,
-    amount,
-    valueUsdt,
-    priceUsdt,
-    timestamp: new Date().toISOString(),
-  });
-}
-
-function startMocking() {
-  setInterval(() => mockTrade('base'), 2500);
-  setInterval(() => mockTrade('solana'), 3000);
-}
-
 const server = http.createServer((req, res) => {
   const safePath = req.url === '/' ? '/index.html' : req.url;
   const filePath = path.join(publicDir, decodeURIComponent(safePath));
@@ -292,10 +247,6 @@ server.on('upgrade', (req, socket) => {
   socket.write(`${headers.join('\r\n')}\r\n\r\n`);
   handleSocket(socket);
 });
-
-if (USE_MOCK) {
-  startMocking();
-}
 
 server.listen(PORT, () => {
   console.log(`Wallet tracker running on http://localhost:${PORT}`);

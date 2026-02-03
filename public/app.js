@@ -18,6 +18,7 @@ let trades = [];
 let selectedTokenKey = null;
 const priceSeriesMap = new Map();
 let chartTimer = null;
+const nicknameMap = new Map();
 
 function connect() {
   const wsProtocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
@@ -55,10 +56,10 @@ function connect() {
 
 function hydrateWallets(wallets = {}) {
   if (wallets.base) {
-    baseInput.value = wallets.base.join('\n');
+    baseInput.value = wallets.base.map((wallet) => formatWalletDisplay(wallet)).join('\n');
   }
   if (wallets.solana) {
-    solanaInput.value = wallets.solana.join('\n');
+    solanaInput.value = wallets.solana.map((wallet) => formatWalletDisplay(wallet)).join('\n');
   }
   const walletCount = (wallets.base?.length || 0) + (wallets.solana?.length || 0);
   walletCountEl.textContent = walletCount.toString();
@@ -79,10 +80,35 @@ function sendWalletUpdate() {
 }
 
 function parseWallets(value) {
+  nicknameMap.clear();
   return value
     .split(/[\n,]/)
     .map((wallet) => wallet.trim())
-    .filter(Boolean);
+    .filter(Boolean)
+    .map((wallet) => parseWalletEntry(wallet))
+    .filter((wallet) => wallet.length > 0);
+}
+
+function parseWalletEntry(entry) {
+  if (entry.includes(':')) {
+    const [nickname, address] = entry.split(':').map((part) => part.trim());
+    if (address) {
+      if (nickname) {
+        nicknameMap.set(address, nickname);
+      }
+      return address;
+    }
+    return nickname || '';
+  }
+  return entry;
+}
+
+function formatWalletDisplay(address) {
+  const nickname = nicknameMap.get(address);
+  if (nickname) {
+    return `${nickname}:${address}`;
+  }
+  return address;
 }
 
 function shortenWallet(wallet) {
@@ -99,6 +125,32 @@ function formatNumber(value, decimals = 4) {
   });
 }
 
+async function copyToClipboard(text) {
+  if (navigator.clipboard && window.isSecureContext) {
+    await navigator.clipboard.writeText(text);
+    return;
+  }
+  const textarea = document.createElement('textarea');
+  textarea.value = text;
+  textarea.setAttribute('readonly', '');
+  textarea.style.position = 'absolute';
+  textarea.style.left = '-9999px';
+  document.body.appendChild(textarea);
+  textarea.select();
+  document.execCommand('copy');
+  document.body.removeChild(textarea);
+}
+
+function showCopyState(button) {
+  const original = button.textContent;
+  button.textContent = 'Copied';
+  button.classList.add('copied');
+  setTimeout(() => {
+    button.textContent = original;
+    button.classList.remove('copied');
+  }, 1200);
+}
+
 function renderTrades() {
   feedRows.innerHTML = '';
   trades.forEach((trade) => {
@@ -107,11 +159,14 @@ function renderTrades() {
 
     const tokenLabel = `${trade.token.name} (${trade.token.symbol})`;
     const time = new Date(trade.timestamp).toISOString().replace('T', ' ').replace('Z', '');
+    const nickname = nicknameMap.get(trade.wallet);
+    const walletLabel = nickname ? `<div class="wallet-nickname">${nickname}</div>` : '';
+    const walletAddress = `<div class="wallet-address">${shortenWallet(trade.wallet)}</div>`;
 
     const buyUrl = buildPhantomLink(trade);
 
     row.innerHTML = `
-      <span title="${trade.wallet}">${shortenWallet(trade.wallet)}</span>
+      <span class="wallet-cell" title="${trade.wallet}">${walletLabel}${walletAddress}</span>
       <span class="chain ${trade.chain}">${trade.chain}</span>
       <span>${tokenLabel}</span>
       <span class="mono" title="${trade.token.address}">${shortenWallet(trade.token.address)}</span>
@@ -120,10 +175,11 @@ function renderTrades() {
       <span>${formatNumber(trade.priceUsdt, 6)}</span>
       <span class="mono">${time}</span>
       <span><button class="buy-button" data-url="${buyUrl}">Buy</button></span>
+      <span><button class="copy-button" data-address="${trade.token.address}">Copy</button></span>
     `;
 
     row.addEventListener('click', (event) => {
-      if (event.target.closest('.buy-button')) {
+      if (event.target.closest('.buy-button, .copy-button')) {
         return;
       }
       selectToken(trade);
@@ -134,6 +190,14 @@ function renderTrades() {
       event.stopPropagation();
       const url = event.currentTarget.dataset.url;
       window.open(url, '_blank', 'noopener,noreferrer');
+    });
+
+    const copyButton = row.querySelector('.copy-button');
+    copyButton.addEventListener('click', async (event) => {
+      event.stopPropagation();
+      const address = event.currentTarget.dataset.address;
+      await copyToClipboard(address);
+      showCopyState(event.currentTarget);
     });
 
     feedRows.appendChild(row);
