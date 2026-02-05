@@ -30,7 +30,7 @@ function loadEnv() {
 loadEnv();
 
 const PORT = process.env.PORT || 3000;
-const MIN_TRADE_USD = 500;
+const MIN_TRADE_USD = Number(process.env.MIN_TRADE_USD || 1); // Minimum trade value in USD to display
 const DEXSCREENER_BASE_URL = 'https://api.dexscreener.com';
 const ALCHEMY_WEBHOOK_SIGNING_KEY =
   process.env.ALCHEMY_WEBHOOK_SIGNING_KEY ||
@@ -65,6 +65,12 @@ const SOLANA_SOL_MINT = 'So11111111111111111111111111111111111111112';
 const PRICE_CACHE = new Map();
 const PRICE_CACHE_TTL_MS = Number(process.env.PRICE_CACHE_TTL_MS || 60000);
 const DEX_CHAIN_IDS = {
+  base: 'base',
+  solana: 'solana',
+  ethereum: 'ethereum',
+};
+
+const PRICE_PLATFORMS = {
   base: 'base',
   solana: 'solana',
   ethereum: 'ethereum',
@@ -114,9 +120,39 @@ function parseTrackedWallets(raw) {
   return { set, nameByAddress };
 }
 
-const trackedWalletsParsed = parseTrackedWallets(process.env.TRACKED_WALLETS || '');
-const TRACKED_WALLETS = trackedWalletsParsed.set;
-const TRACKED_WALLET_NAMES = trackedWalletsParsed.nameByAddress;
+// Tracked wallets configuration (name -> address).
+// Solana and Base/Ethereum wallets separated for chain-specific processing.
+const TRACKED_WALLETS_CONFIG = {
+  // Solana wallets
+  logjam: '5fkAwNVpT8A1UHEnY62VEFpqgagdoP8FYrv5ideiQp5c',
+  zinceth: 'HQdFfmiDrZGbxqE5k5CqDxUkLUHhCUS39YHqsRGsfzeH',
+  xsneaky: 'FfztZq1outrYfyYbKw5P4LGo4xUc4XYEdf7o91UdS7qu',
+  collectible: 'F2hA2zDVnHyDUiMQ6b3K9Gx9A2JAxJn66ASH9xZ9LqbG',
+  danish: 'BTcozeUcGohAjoPRm4rXuwEkKQeQsBVQxbUeAErxKGZP',
+  // Base/Ethereum wallets
+  frank: '0x696d1265C8Fc4F14797aBEBFAe3C43EBFA9D8e28',
+  Zinc: '0xca8323cb2b2cfd96963ecb34a7abc5ae172b37bb',
+  danishbase: '0x0CCCd055C953AAC076c37a4a969b90cB58F3E12E',
+};
+
+const SOLANA_WALLET_NAMES = ['logjam', 'zinceth', 'xsneaky', 'collectible', 'danish'];
+
+const TRACKED_WALLETS = new Set();
+const TRACKED_WALLETS_SOLANA = new Set();
+const TRACKED_WALLETS_BASE = new Set();
+const TRACKED_WALLET_NAMES = new Map();
+
+Object.entries(TRACKED_WALLETS_CONFIG).forEach(([name, address]) => {
+  if (!address) return;
+  const lower = String(address).toLowerCase().trim();
+  TRACKED_WALLETS.add(lower);
+  TRACKED_WALLET_NAMES.set(lower, name);
+  if (SOLANA_WALLET_NAMES.includes(name)) {
+    TRACKED_WALLETS_SOLANA.add(lower);
+  } else {
+    TRACKED_WALLETS_BASE.add(lower);
+  }
+});
 
 function sendFrame(socket, payload) {
   const data = Buffer.from(payload);
@@ -149,6 +185,9 @@ function sendFrame(socket, payload) {
 
 function broadcast(payload) {
   const message = JSON.stringify(payload);
+  try {
+    console.log(`Broadcasting ${payload.type || 'message'} to ${clients.size} clients`);
+  } catch (e) {}
   for (const client of clients) {
     if (!client.destroyed) {
       sendFrame(client, message);
@@ -157,6 +196,9 @@ function broadcast(payload) {
 }
 
 function recordTrade(trade, options = {}) {
+  try {
+    console.log('recordTrade:', trade?.txHash, 'valueUsdt=', trade?.valueUsdt, 'options=', options);
+  } catch (e) {}
   if (!options.skipFilter && trade.valueUsdt < MIN_TRADE_USD) {
     return;
   }
@@ -470,14 +512,21 @@ async function parseSolanaSwap(wallet, tx) {
   const post = new Map();
   const owner = wallet;
 
-  (tx.meta.preTokenBalances || []).forEach((balance) => {
-    if (balance.owner === owner) {
-      pre.set(balance.mint, Number(balance.uiTokenAmount?.uiAmount || 0));
+  let meta = tx.meta || {};
+  if (Array.isArray(meta) && meta.length > 0) meta = meta[0];
+  const preTokenBalances = meta.preTokenBalances || meta.pre_token_balances || [];
+  const postTokenBalances = meta.postTokenBalances || meta.post_token_balances || [];
+
+  preTokenBalances.forEach((balance) => {
+    const balOwner = (balance.owner || '').toString().toLowerCase();
+    if (balOwner === owner) {
+      pre.set(balance.mint, Number(balance.uiTokenAmount?.uiAmount || balance.ui_token_amount?.ui_amount || 0));
     }
   });
-  (tx.meta.postTokenBalances || []).forEach((balance) => {
-    if (balance.owner === owner) {
-      post.set(balance.mint, Number(balance.uiTokenAmount?.uiAmount || 0));
+  postTokenBalances.forEach((balance) => {
+    const balOwner = (balance.owner || '').toString().toLowerCase();
+    if (balOwner === owner) {
+      post.set(balance.mint, Number(balance.uiTokenAmount?.uiAmount || balance.ui_token_amount?.ui_amount || 0));
     }
   });
 
@@ -490,18 +539,7 @@ async function parseSolanaSwap(wallet, tx) {
     }
   });
 
-  const accountKeys = tx.transaction.message.accountKeys || [];
-  const walletIndex = accountKeys.findIndex((key) => normalizeSolanaAccountKey(key) === wallet);
-  if (walletIndex !== -1 && Array.isArray(tx.meta.preBalances)) {
-    const preLamports = tx.meta.preBalances[walletIndex] || 0;
-    const postLamports = tx.meta.postBalances[walletIndex] || 0;
-    const deltaSol = (postLamports - preLamports) / 1e9;
-    if (Math.abs(deltaSol) > 0) {
-      net.set(SOLANA_SOL_MINT, deltaSol);
-    }
-  }
-
-  if (net.size < 2) {
+  if (net.size < 1) {
     return null;
   }
 
@@ -514,14 +552,15 @@ async function parseSolanaSwap(wallet, tx) {
 
   const netEntries = [...net.entries()];
   netEntries.sort((a, b) => Math.abs(b[1]) - Math.abs(a[1]));
-  let acquired = netEntries.find(([mint, amount]) => amount > 0 && !SOLANA_STABLE_MINTS.has(mint)) ||
-    netEntries.find(([, amount]) => amount > 0);
-
-  if (!acquired) {
+  
+  // Find the main token: either acquired (buy) or sold (sell), excluding stables
+  let mainToken = netEntries.find(([mint, amount]) => !SOLANA_STABLE_MINTS.has(mint));
+  
+  if (!mainToken) {
     return null;
   }
 
-  const [mint, amount] = acquired;
+  const [mint, amount] = mainToken;
   const token = {
     name: mint === SOLANA_SOL_MINT ? 'Solana' : 'Token',
     symbol: mint === SOLANA_SOL_MINT ? 'SOL' : 'TOKEN',
@@ -550,15 +589,27 @@ async function parseSolanaSwap(wallet, tx) {
     return null;
   }
 
+  // determine txHash from different shapes
+  let txHash = '';
+  if (typeof tx.signature === 'string') txHash = tx.signature;
+  else if (tx.signature && typeof tx.signature === 'string') txHash = tx.signature;
+  else if (txObj && Array.isArray(txObj.signatures) && txObj.signatures.length > 0) txHash = txObj.signatures[0];
+  else if (tx.transaction && Array.isArray(tx.transaction) && tx.transaction[0] && Array.isArray(tx.transaction[0].signatures)) txHash = tx.transaction[0].signatures[0];
+
+  // Get wallet name
+  const traderName = TRACKED_WALLET_NAMES.get(owner) || '';
+
   return {
     chain: 'solana',
-    wallet,
+    wallet: owner,
+    traderName,
     token,
     amount: Math.abs(amount),
     valueUsdt,
     priceUsdt: valueUsdt && amount ? valueUsdt / Math.abs(amount) : 0,
+    side: amount > 0 ? 'buy' : 'sell',
     timestamp: tx.blockTime ? new Date(tx.blockTime * 1000).toISOString() : new Date().toISOString(),
-    txHash: tx.transaction?.signatures?.[0] || '',
+    txHash: txHash || '',
   };
 }
 
@@ -696,8 +747,14 @@ const server = http.createServer((req, res) => {
   if (req.method === 'POST' && req.url === WEBHOOK_PATH) {
     readRequestBody(req)
       .then(async (body) => {
+        try {
+          console.log('Incoming webhook headers:', req.headers);
+          console.log('Incoming webhook body:', body);
+        } catch (e) {}
+
         const signature = req.headers['x-alchemy-signature'];
         if (!verifyAlchemySignature(body, signature)) {
+          console.warn('Invalid webhook signature:', signature);
           res.writeHead(401);
           res.end('Invalid signature');
           return;
@@ -706,18 +763,56 @@ const server = http.createServer((req, res) => {
         try {
           payload = JSON.parse(body);
         } catch (error) {
+          console.warn('Invalid JSON payload');
           res.writeHead(400);
           res.end('Invalid JSON');
           return;
         }
 
-        const activityList = payload.activity || payload.event?.activity || [];
+        // Handle both Base/Ethereum (activity) and Solana (transaction) formats
+        let activityList = payload.activity || payload.event?.activity || [];
+        let isSolanaWebhook = false;
+        
+        if (activityList.length === 0 && payload.event?.transaction) {
+          isSolanaWebhook = true;
+          activityList = payload.event.transaction || [];
+        }
+
+        try {
+          console.log('Webhook parsed. network:', payload.network, 'activity/transaction count:', activityList.length);
+        } catch (e) {}
+
         for (const activity of activityList) {
-          const trade = await activityToTrade(activity, payload);
+          let trade = null;
+          try {
+            if (isSolanaWebhook) {
+              // For Solana: activity is a transaction object, need to parse swaps for tracked wallets
+              console.log('Processing Solana transaction:', activity?.signature);
+              const trackedSwaps = [];
+              for (const wallet of TRACKED_WALLETS_SOLANA) {
+                const swap = await parseSolanaSwap(wallet, activity);
+                if (swap) {
+                  trackedSwaps.push(swap);
+                }
+              }
+              if (trackedSwaps.length > 0) {
+                trade = trackedSwaps[0]; // Use first swap if multiple
+              }
+            } else {
+              // For Base/Ethereum: activity is an activity object
+              trade = await activityToTrade(activity, payload);
+            }
+            console.log('Activity converted to trade:', trade ? trade.txHash : 'null');
+          } catch (e) {
+            console.error('Error converting activity to trade:', e?.message || e);
+            continue;
+          }
           if (!trade) {
+            console.log('Trade conversion returned null; skipping');
             continue;
           }
           if (tracking.base.seenTxs.has(trade.txHash)) {
+            console.log('Skipping already seen tx:', trade.txHash);
             continue;
           }
           rememberSeen(tracking.base.seenTxs, trade.txHash);
@@ -728,7 +823,7 @@ const server = http.createServer((req, res) => {
         res.end('ok');
       })
       .catch((error) => {
-        console.error('Webhook error:', error.message);
+        console.error('Webhook error:', error?.message || error);
         res.writeHead(500);
         res.end('error');
       });
