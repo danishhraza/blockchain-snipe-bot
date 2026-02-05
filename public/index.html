@@ -11,26 +11,10 @@
       <header>
         <div>
           <h1>Wallet Buy Tracker</h1>
-          <p class="subtitle">Real-time feed of ≥ $500 token buys on Base &amp; Solana.</p>
+          <p class="subtitle">Real-time feed token buys on Base &amp; Solana.</p>
         </div>
         <div class="status" id="connectionStatus">Connecting…</div>
       </header>
-
-      <section class="controls">
-        <div class="control-card">
-          <h2>Live Metrics</h2>
-          <div class="metrics">
-            <div>
-              <span class="metric-label">Latest buy value</span>
-              <span class="metric-value" id="latestValue">-</span>
-            </div>
-            <div>
-              <span class="metric-label">Last update (UTC)</span>
-              <span class="metric-value" id="latestTime">-</span>
-            </div>
-          </div>
-        </div>
-      </section>
 
       <section class="feed">
         <h2>Live Buy Feed</h2>
@@ -45,33 +29,15 @@
             <span>Value (USDT)</span>
             <span>Price (USDT)</span>
             <span>Time (UTC)</span>
-            <span>Buy</span>
+            <span>DEX</span>
             <span>Copy</span>
           </div>
           <div id="feedRows" class="feed-body"></div>
         </div>
       </section>
 
-      <section class="chart-panel">
-        <h2>Token Price Tracker</h2>
-        <p id="chartSubtitle">Select a trade row to view the token price curve and buy checkpoints.</p>
-        <div class="chart-card">
-          <div class="chart-header">
-            <div>
-              <div class="chart-title" id="chartTitle">No token selected</div>
-              <div class="chart-meta" id="chartMeta">—</div>
-            </div>
-            <div class="chart-legend">
-              <span class="legend-dot"></span>
-              Wallet buys
-            </div>
-          </div>
-          <div id="priceChart" class="price-chart"></div>
-        </div>
-      </section>
     </div>
 
-    <script src="https://unpkg.com/lightweight-charts@4.1.0/dist/lightweight-charts.standalone.production.js"></script>
     <script src="app.js"></script>
   </body>
 </html>

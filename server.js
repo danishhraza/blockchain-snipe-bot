@@ -316,6 +316,42 @@ async function fetchDexPrice(chainId, address) {
   return best.price;
 }
 
+async function fetchTokenMetadata(chainId, address) {
+  if (!chainId || !address) return null;
+  const url = `${DEXSCREENER_BASE_URL}/tokens/v1/${chainId}/${address}`;
+  try {
+    const response = await fetchJson(url, { method: 'GET' });
+    if (!Array.isArray(response) || response.length === 0) return null;
+    // Try multiple locations for token name/symbol depending on DEXScreener response shape
+    for (const item of response) {
+      const candidates = [
+        item?.token,
+        item?.baseToken,
+        item?.token0,
+        item?.token1,
+        item?.pair?.baseToken,
+        item?.pair?.token,
+        item?.pair,
+      ];
+      for (const c of candidates) {
+        if (c && (c.name || c.symbol)) {
+          return {
+            name: c.name || c.symbol || null,
+            symbol: c.symbol || c.name || null,
+          };
+        }
+      }
+      // Fallback: top-level name/symbol
+      if (item?.name || item?.symbol) {
+        return { name: item.name || null, symbol: item.symbol || null };
+      }
+    }
+    return null;
+  } catch (e) {
+    return null;
+  }
+}
+
 async function getUsdPriceForAddress(chainId, address) {
   const key = `${chainId}:${address}`.toLowerCase();
   const cached = getCachedPrice(key);
@@ -562,13 +598,26 @@ async function parseSolanaSwap(wallet, tx) {
 
   const [mint, amount] = mainToken;
   const token = {
-    name: mint === SOLANA_SOL_MINT ? 'Solana' : 'Token',
-    symbol: mint === SOLANA_SOL_MINT ? 'SOL' : 'TOKEN',
+    name: mint === SOLANA_SOL_MINT ? 'Solana' : null,
+    symbol: mint === SOLANA_SOL_MINT ? 'SOL' : null,
     address: mint,
   };
+
   if (SOLANA_STABLE_MINTS.has(mint)) {
     token.name = mint === 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v' ? 'USD Coin' : 'Tether USD';
     token.symbol = mint === 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v' ? 'USDC' : 'USDT';
+  } else if (mint === SOLANA_SOL_MINT) {
+    token.name = token.name || 'Solana';
+    token.symbol = token.symbol || 'SOL';
+  } else {
+    const meta = await fetchTokenMetadata('solana', mint);
+    if (meta) {
+      token.name = meta.name || meta.symbol || 'Token';
+      token.symbol = meta.symbol || meta.name || 'TOKEN';
+    } else {
+      token.name = 'Token';
+      token.symbol = 'TOKEN';
+    }
   }
 
   let valueUsdt = Math.abs(stableDelta || 0);
